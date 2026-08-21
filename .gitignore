@@ -1,0 +1,14 @@
+# Runtime/private state
+.env
+*.secret
+*.token
+state/
+cache/
+memory/
+private/
+benchmarks/results-private/
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/

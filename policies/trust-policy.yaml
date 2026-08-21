@@ -1,0 +1,13 @@
+version: 1
+default:
+  approval_after_planning: required
+  autonomous_writes: denied
+
+fast_path:
+  proposal_after_consecutive_clean_runs: 3
+  activation: operator_only
+  revoke_on:
+    - failed_test
+    - material_review_finding
+    - operator_correction
+    - scope_violation

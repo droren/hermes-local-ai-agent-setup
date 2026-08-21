@@ -1,0 +1,40 @@
+version: 1
+roles:
+  planner:
+    purpose: decompose requests into bounded verifiable tasks
+    requires:
+      - planning.decomposition
+      - reasoning.medium
+      - structured_output
+    may_write_code: false
+
+  implementer:
+    purpose: implement exactly one bounded task
+    requires:
+      - code.implement
+      - tool_calling
+    scope_expansion: forbidden
+
+  reviewer:
+    purpose: independently review implementation against evidence and acceptance criteria
+    requires:
+      - code.review
+      - reasoning.medium
+    independence_required: true
+
+  tester:
+    purpose: verify behavior using appropriate tests
+    requires:
+      - test.design
+      - tool_calling
+
+  security_reviewer:
+    purpose: perform risk-proportionate security review
+    requires:
+      - security.review
+
+  documenter:
+    purpose: update documentation and completion memory
+    requires:
+      - documentation.write
+      - summarization.compact

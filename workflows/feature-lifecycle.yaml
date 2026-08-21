@@ -1,0 +1,61 @@
+version: 1
+name: feature_lifecycle
+steps:
+  - id: retrieve_context
+    role: orchestrator
+    requires: [knowledge.search]
+
+  - id: detect_prior_work
+    role: orchestrator
+    depends_on: [retrieve_context]
+
+  - id: scope
+    role: planner
+    depends_on: [detect_prior_work]
+
+  - id: decompose
+    role: planner
+    conditional: task_too_large
+    depends_on: [scope]
+
+  - id: plan
+    role: planner
+    depends_on: [scope]
+
+  - id: approval
+    role: human
+    conditional: policy_requires_approval
+    depends_on: [plan]
+
+  - id: implement
+    role: implementer
+    depends_on: [approval]
+
+  - id: review
+    role: reviewer
+    depends_on: [implement]
+
+  - id: test
+    role: tester
+    depends_on: [review]
+
+  - id: security
+    role: security_reviewer
+    conditional: security_review_required
+    depends_on: [test]
+
+  - id: document
+    role: documenter
+    depends_on: [test]
+
+  - id: accept
+    role: orchestrator
+    depends_on: [document]
+
+  - id: update_knowledge
+    role: orchestrator
+    depends_on: [accept]
+
+  - id: update_experience
+    role: orchestrator
+    depends_on: [accept]

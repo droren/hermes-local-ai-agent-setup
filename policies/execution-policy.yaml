@@ -1,0 +1,28 @@
+version: 1
+rules:
+  - id: retrieve-first
+    when: non_trivial_task
+    require: knowledge_retrieval
+
+  - id: decompose-before-escalation
+    when: local_model_reports_too_complex
+    require: decomposition_attempt
+
+  - id: local-first
+    when: capability_available_locally
+    prefer: local
+
+  - id: independent-review
+    when: code_changed
+    require: reviewer_role
+
+  - id: testing-required
+    when: executable_behavior_changed
+    require: tester_role
+
+  - id: external-minimize-data
+    when: external_execution
+    require:
+      - policy_approval
+      - data_minimization
+      - no_credentials

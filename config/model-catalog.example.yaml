@@ -1,0 +1,51 @@
+version: 1
+models:
+  - id: local-fast-general
+    backend: ollama
+    endpoint: http://AI_HOST:11434
+    model: REPLACE_ME
+    execution_class: local
+    memory_gb_estimate: 6
+    max_parallel: 2
+    capabilities:
+      - routing.classify
+      - summarization.compact
+      - structured_output
+      - reasoning.light
+
+  - id: local-code-specialist
+    backend: ollama
+    endpoint: http://AI_HOST:11434
+    model: REPLACE_ME
+    execution_class: local
+    memory_gb_estimate: 12
+    max_parallel: 2
+    capabilities:
+      - code.implement
+      - code.review
+      - test.design
+      - tool_calling
+      - structured_output
+
+  - id: local-reasoner
+    backend: ollama
+    endpoint: http://AI_HOST:11434
+    model: REPLACE_ME
+    execution_class: local
+    memory_gb_estimate: 24
+    max_parallel: 1
+    capabilities:
+      - planning.decomposition
+      - architecture.reasoning
+      - reasoning.medium
+      - reasoning.deep
+      - structured_output
+
+  - id: external-research-or-escalation
+    backend: existing-hermes-provider
+    execution_class: external
+    external_policy: escalation_only
+    capabilities:
+      - research.web.current
+      - architecture.reasoning
+      - reasoning.deep
