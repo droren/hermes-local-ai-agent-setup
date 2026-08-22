@@ -1,0 +1,150 @@
+version: 1
+profile: hermes-next-local-measured-v0.2
+status: experimental
+
+principles:
+  - retrieve_before_infer
+  - capability_first
+  - local_first
+  - decompose_before_escalate
+  - independent_review_and_test
+  - external_only_on_explicit_escalation
+
+roles:
+  router:
+    model_ref: local-router-small
+    capabilities:
+      - routing.classify
+      - summarization.compact
+      - structured_output
+    context_policy:
+      fresh_per_task: true
+      max_context_tokens: 8192
+    output_policy:
+      prefer_json: true
+      bounded_output: true
+
+  implementer:
+    model_ref: local-implementer-small
+    capabilities:
+      - code.implement.small
+      - code.review.light
+      - structured_output
+    context_policy:
+      fresh_per_subtask: true
+      include_only:
+        - task_spec
+        - acceptance_criteria
+        - retrieved_project_rules
+        - relevant_files
+    execution_policy:
+      mutate_worktree_only_after_plan: true
+      require_diff_after_change: true
+
+  tester:
+    model_ref: local-tester-small
+    capabilities:
+      - test.design
+      - test.review
+    context_policy:
+      fresh_per_task: true
+      forbidden_context:
+        - implementer_chain_of_thought
+        - implementer_conversation_history
+      include_only:
+        - task_spec
+        - acceptance_criteria
+        - resulting_diff
+        - existing_tests
+        - retrieved_project_rules
+    execution_policy:
+      independent_from_implementer: true
+
+workflow:
+  - state: retrieve
+    action: search_existing_knowledge_and_experience
+    on_hit: reuse_or_adapt
+    on_miss: classify
+
+  - state: classify
+    role: router
+    action: classify_and_size_task
+    transitions:
+      small: implement
+      medium: decompose
+      large: decompose
+      requires_current_web: external_research_gate
+
+  - state: decompose
+    role: router
+    action: create_bounded_subtasks
+    requirements:
+      - each_subtask_has_acceptance_criteria
+      - each_subtask_is_independently_testable
+      - avoid_cross_subtask_context_when_possible
+    transition: implement
+
+  - state: implement
+    role: implementer
+    action: execute_one_bounded_subtask
+    transition: test_design
+
+  - state: test_design
+    role: tester
+    action: independently_design_or_review_tests
+    transition: verify
+
+  - state: verify
+    actions:
+      - run_tests
+      - inspect_diff
+      - validate_acceptance_criteria
+    transitions:
+      pass: record_experience
+      fail: repair_or_escalate
+
+  - state: repair_or_escalate
+    policy:
+      local_retry_limit: 2
+      first_retry: implementer_with_failure_evidence
+      second_retry: local_fallback_or_senior_model
+      after_local_failure: explicit_external_escalation
+
+  - state: record_experience
+    actions:
+      - record_model_capability_outcome
+      - record_human_corrections
+      - record_latency_and_failures
+      - update_retrievable_project_memory
+    policy:
+      never_silently_rewrite_production_routing: true
+
+concurrency:
+  validated: true
+  profile:
+    router: 1
+    implementer: 1
+    tester: 1
+  measured_on:
+    host_class: mac_m4_pro_48gb
+    sequential_average_seconds: 6.567
+    concurrent_average_seconds: 5.715
+    effective_speedup: 1.149
+  scheduler_guidance:
+    - concurrency_improves_total_wall_time_but_reduces_router_and_tester_tokens_per_second
+    - prefer_parallel_execution_only_for_independent_work
+    - do_not_parallelize_strict_dependencies_just_to_increase_gpu_usage
+
+escalation:
+  local_fallback_order:
+    code:
+      - local-code-fallback-8b
+      - local-code-specialist-moe
+      - local-quality-reserve-dense
+  external_conditions:
+    - current_web_research_materially_required
+    - repeated_local_quality_gate_failure
+    - architecture_risk_requires_stronger_independent_review
+    - task_cannot_be_decomposed_to_local_capabilities
+  external_context_policy:
+    minimum_necessary_context_only: true
