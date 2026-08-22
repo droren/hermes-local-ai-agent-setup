@@ -8,6 +8,7 @@ import os
 import platform
 import subprocess
 import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,33 +43,10 @@ def memory_snapshot() -> dict:
     return result
 
 
-def main() -> None:
-    p = argparse.ArgumentParser()
-    p.add_argument("--model", required=True)
-    p.add_argument("--capability", required=True)
-    p.add_argument("--prompt-file", required=True)
-    p.add_argument("--endpoint", default=os.environ.get("OLLAMA_ENDPOINT", "http://127.0.0.1:11434"))
-    p.add_argument("--context", type=int, default=8192)
-    p.add_argument("--timeout", type=int, default=600)
-    p.add_argument("--output-dir", default="artifacts/benchmarks")
-    args = p.parse_args()
-
-    prompt = Path(args.prompt_file).read_text(encoding="utf-8")
-    before = memory_snapshot()
-    started = time.perf_counter()
-    response = post_json(
-        args.endpoint.rstrip("/") + "/api/generate",
-        {
-            "model": args.model,
-            "prompt": prompt,
-            "stream": False,
-            "options": {"num_ctx": args.context, "temperature": 0},
-        },
-        args.timeout,
-    )
+def write_record(args, started: float, before: dict, response: dict | None, error: str | None) -> Path:
     wall = time.perf_counter() - started
     after = memory_snapshot()
-
+    response = response or {}
     eval_count = int(response.get("eval_count", 0) or 0)
     eval_duration_ns = int(response.get("eval_duration", 0) or 0)
     prompt_count = int(response.get("prompt_eval_count", 0) or 0)
@@ -77,7 +55,7 @@ def main() -> None:
     tps = eval_count / (eval_duration_ns / 1e9) if eval_duration_ns else None
 
     record = {
-        "schema_version": 1,
+        "schema_version": 2,
         "captured_at": datetime.now(timezone.utc).isoformat(),
         "host": platform.node(),
         "backend": "ollama",
@@ -86,6 +64,10 @@ def main() -> None:
         "capability": args.capability,
         "prompt_file": args.prompt_file,
         "context_requested": args.context,
+        "max_output_tokens": args.max_output_tokens,
+        "timeout_seconds": args.timeout,
+        "status": "error" if error else "completed",
+        "error": error,
         "metrics": {
             "wall_seconds": round(wall, 3),
             "load_seconds": round(load_duration_ns / 1e9, 3),
@@ -103,7 +85,7 @@ def main() -> None:
             "automatic_score": None,
             "human_score": None,
             "human_corrections": None,
-            "accepted": None,
+            "accepted": False if error else None,
             "notes": None,
         },
     }
@@ -114,7 +96,48 @@ def main() -> None:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out = out_dir / f"{stamp}-{safe_model}-{args.capability.replace('.', '_')}.json"
     out.write_text(json.dumps(record, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return out
+
+
+def main() -> None:
+    p = argparse.ArgumentParser()
+    p.add_argument("--model", required=True)
+    p.add_argument("--capability", required=True)
+    p.add_argument("--prompt-file", required=True)
+    p.add_argument("--endpoint", default=os.environ.get("OLLAMA_ENDPOINT", "http://127.0.0.1:11434"))
+    p.add_argument("--context", type=int, default=8192)
+    p.add_argument("--max-output-tokens", type=int, default=384)
+    p.add_argument("--timeout", type=int, default=120)
+    p.add_argument("--output-dir", default="artifacts/benchmarks")
+    args = p.parse_args()
+
+    prompt = Path(args.prompt_file).read_text(encoding="utf-8")
+    before = memory_snapshot()
+    started = time.perf_counter()
+    response = None
+    error = None
+    try:
+        response = post_json(
+            args.endpoint.rstrip("/") + "/api/generate",
+            {
+                "model": args.model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "num_ctx": args.context,
+                    "num_predict": args.max_output_tokens,
+                    "temperature": 0,
+                },
+            },
+            args.timeout,
+        )
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+
+    out = write_record(args, started, before, response, error)
     print(out)
+    if error:
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":
