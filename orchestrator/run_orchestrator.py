@@ -235,31 +235,107 @@ def retrieve_local(task: str, roots: list[str], limit: int = 6) -> list[dict[str
     return hits[:limit]
 
 
-def route_task(endpoint: str, model: str, task: str, knowledge: list[dict[str, Any]], ctx: int):
-    knowledge_text = "\n".join(f"- {h['path']}: {h['snippet']}" for h in knowledge) or "- none found"
-    prompt = f"""You are the Hermes Next routing agent.
-Classify the task; do not solve it.
+def heuristic_route(task: str) -> dict[str, Any]:
+    """Deterministic local fallback. Routing must never be a single point of failure."""
+    low = task.lower()
 
-Task:
+    web_terms = ("latest", "current news", "today", "web search", "internet search", "look up online", "research online")
+    review_terms = ("review", "audit", "inspect code", "find bugs", "code quality")
+    test_terms = ("design tests", "test design", "write tests", "add tests", "boundary tests", "regression tests")
+    planning_terms = ("architecture", "architect", "plan the", "decompose", "break down", "migration plan")
+    summary_terms = ("summarize", "summary", "condense")
+    structured_terms = ("extract json", "return json", "structured output", "parse into")
+    code_terms = (
+        "add ", "implement", "fix ", "change ", "modify", "refactor", "validation",
+        "api", "function", "class", "php", "python", "javascript", "typescript", "code",
+    )
+
+    needs_web = any(term in low for term in web_terms)
+    if needs_web:
+        capability = "research.web.current"
+    elif any(term in low for term in review_terms) and not any(term in low for term in code_terms):
+        capability = "code.review"
+    elif any(term in low for term in planning_terms):
+        capability = "planning.decomposition"
+    elif any(term in low for term in summary_terms):
+        capability = "summarization.compact"
+    elif any(term in low for term in structured_terms):
+        capability = "structured_output"
+    elif any(term in low for term in test_terms) and not any(term in low for term in code_terms):
+        capability = "test.design"
+    elif any(term in low for term in code_terms):
+        capability = "code.implement.small"
+    else:
+        capability = "planning.decomposition"
+
+    objective_markers = sum(
+        1 for term in (
+            " and ", " also ", " preserve ", " without changing", " add tests", " boundary tests",
+            " regression tests", " migrate ", " across ", " multiple ",
+        )
+        if term in low
+    )
+    large_markers = any(term in low for term in ("architecture", "migration", "multiple services", "entire", "whole system", "across repositories"))
+    if large_markers or len(task) > 700:
+        complexity = "large"
+    elif objective_markers >= 2 or len(task) > 220:
+        complexity = "medium"
+    else:
+        complexity = "small"
+
+    needs_decomposition = complexity != "small" or objective_markers >= 2
+    if capability in {"code.review", "test.design", "summarization.compact", "structured_output"} and complexity == "small":
+        needs_decomposition = False
+
+    return {
+        "capability": capability,
+        "complexity": complexity,
+        "needs_decomposition": needs_decomposition,
+        "needs_current_web": needs_web,
+        "reason": "deterministic fallback after local LLM router failed schema validation",
+    }
+
+
+def route_task(endpoint: str, model: str, task: str, knowledge: list[dict[str, Any]], ctx: int):
+    # Retrieval happens before routing, but routing only needs evidence that prior knowledge exists.
+    # Feeding full retrieved snippets to a tiny classifier made qwen3:1.7b collapse to `{}`.
+    knowledge_paths = [h["path"] for h in knowledge[:4]]
+    knowledge_summary = (
+        f"{len(knowledge)} local knowledge hits found. Top paths: " + ", ".join(knowledge_paths)
+        if knowledge else "No local knowledge hits found."
+    )
+    prompt = f"""You are a task classifier. Do not solve the task.
+
+TASK:
 {task}
 
-Previously retrieved local knowledge:
-{knowledge_text}
+KNOWLEDGE STATUS:
+{knowledge_summary}
 
-Allowed capabilities: {', '.join(sorted(ALLOWED_CAPABILITIES))}
+Choose exactly one capability from this list:
+code.implement.small, code.implement, code.review, test.design, planning.decomposition, research.web.current, structured_output, summarization.compact
 
-Return exactly one JSON object with all fields populated:
-{{
-  "capability": "one allowed capability",
-  "complexity": "small|medium|large",
-  "needs_decomposition": true,
-  "needs_current_web": false,
-  "reason": "one short reason"
-}}
+Return one JSON object with these exact fields and no others:
+{{"capability":"code.implement.small","complexity":"small","needs_decomposition":false,"needs_current_web":false,"reason":"short reason"}}
+
+Replace the example values with your classification. Never return an empty object.
 """
-    return generate_json_with_retry(
-        endpoint, model, prompt, ctx=ctx, max_tokens=384, stage="router", validator=validate_route
-    )
+    try:
+        parsed, raw = generate_json_with_retry(
+            endpoint, model, prompt, ctx=min(ctx, 4096), max_tokens=192, stage="router", validator=validate_route
+        )
+        raw["routing_source"] = "llm"
+        return parsed, raw
+    except RuntimeError as exc:
+        route = heuristic_route(task)
+        raw = {
+            "model": model,
+            "response": "",
+            "routing_source": "heuristic_fallback",
+            "llm_router_error": str(exc),
+            "knowledge_hits_seen": len(knowledge),
+        }
+        return route, raw
 
 
 def decompose_task(endpoint: str, model: str, task: str, route: dict[str, Any], ctx: int):
@@ -405,11 +481,15 @@ def main() -> None:
 
     try:
         route, route_raw = route_task(args.endpoint, args.router_model, task, knowledge, args.context)
-        events.append({"state": "routing", "decision": route})
+        events.append({
+            "state": "routing",
+            "decision": route,
+            "source": route_raw.get("routing_source", "unknown"),
+        })
 
         if route.get("needs_current_web") or route.get("capability") == "research.web.current":
             final = {
-                "schema_version": 3,
+                "schema_version": 4,
                 "status": "external_escalation_recommended",
                 "task": task,
                 "knowledge": knowledge,
@@ -437,7 +517,7 @@ def main() -> None:
                     "verification": {"pass": passed, "reasons": reasons},
                 })
             final = {
-                "schema_version": 3,
+                "schema_version": 4,
                 "status": "verified_proposal" if all_pass else "verification_failed",
                 "task": task,
                 "models": {"router": args.router_model, "worker": args.worker_model, "tester": args.tester_model},
@@ -458,7 +538,7 @@ def main() -> None:
     except Exception as exc:
         events.append({"state": "error", "error": str(exc)})
         final = {
-            "schema_version": 3,
+            "schema_version": 4,
             "status": "orchestrator_error",
             "task": task,
             "models": {"router": args.router_model, "worker": args.worker_model, "tester": args.tester_model},
@@ -477,6 +557,9 @@ def main() -> None:
     out.write_text(json.dumps(final, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
     print(f"status: {final['status']}")
+    if final.get("route"):
+        source = (final.get("router_raw") or {}).get("routing_source", "unknown")
+        print(f"route: {final['route'].get('capability')} ({final['route'].get('complexity')}, source={source})")
     if "subtasks" in final:
         print(f"subtasks: {len(final['subtasks'])}")
         passed = sum(1 for r in final.get("results", []) if r.get("verification", {}).get("pass"))
