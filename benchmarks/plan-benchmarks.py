@@ -4,7 +4,7 @@
 Inputs:
 - cold model inventory JSON from inventory-model-library-v2.py
 - optional host inventory JSON from inventory-host.sh
-- candidate matrix YAML (minimal parser supports the current repository format)
+- candidate matrix YAML using capabilities + benchmark_order
 
 Output:
 - JSON plan classifying candidates as local_now, needs_staging, unavailable, or external_reference
@@ -26,70 +26,121 @@ def load_json(path: str | None) -> dict:
 
 
 def parse_candidate_matrix(path: str) -> list[dict]:
-    """Parse only the small YAML subset used by candidate-matrix-v0.2.yaml.
+    """Parse the repository's dependency-light YAML subset.
 
-    Avoids adding PyYAML as a dependency. Supports:
-      phases:
-        - id: phase1
+    Expected structure:
+
+      capabilities:
+        routing.classify:
+          priority: high
           candidates:
-            - model: qwen3:1.7b
-              capabilities: [routing.classify, summarization.compact]
+            - qwen3:1.7b
+
+      benchmark_order:
+        phase_1_small_specialists:
+          - qwen3:1.7b
+
+    The parser deliberately avoids PyYAML. It extracts capability membership and
+    benchmark phase ordering, then emits the normalized phase/candidate shape
+    consumed by the planner.
     """
     lines = Path(path).read_text(encoding="utf-8").splitlines()
-    phases: list[dict] = []
-    phase: dict | None = None
-    candidate: dict | None = None
-    in_candidates = False
 
-    def flush_candidate() -> None:
-        nonlocal candidate, phase
-        if candidate is not None and phase is not None:
-            phase.setdefault("candidates", []).append(candidate)
-            candidate = None
+    capability_to_models: dict[str, list[str]] = {}
+    capability_priority: dict[str, str] = {}
+    benchmark_order: dict[str, list[str]] = {}
 
-    def flush_phase() -> None:
-        nonlocal phase
-        flush_candidate()
-        if phase is not None:
-            phases.append(phase)
-            phase = None
+    section: str | None = None
+    current_capability: str | None = None
+    in_capability_candidates = False
+    current_phase: str | None = None
 
     for raw in lines:
         stripped = raw.strip()
         if not stripped or stripped.startswith("#"):
             continue
+
         indent = len(raw) - len(raw.lstrip(" "))
 
-        if stripped.startswith("- id:") and indent <= 2:
-            flush_phase()
-            phase = {"id": stripped.split(":", 1)[1].strip(), "candidates": []}
-            in_candidates = False
-            continue
-        if phase is None:
-            continue
-        if stripped.startswith("description:"):
-            phase["description"] = stripped.split(":", 1)[1].strip().strip('"')
-            continue
-        if stripped == "candidates:":
-            in_candidates = True
-            continue
-        if in_candidates and stripped.startswith("- model:"):
-            flush_candidate()
-            candidate = {"model": stripped.split(":", 1)[1].strip()}
-            continue
-        if candidate is not None and stripped.startswith("capabilities:"):
-            value = stripped.split(":", 1)[1].strip()
-            if value.startswith("[") and value.endswith("]"):
-                inner = value[1:-1].strip()
-                candidate["capabilities"] = [x.strip() for x in inner.split(",") if x.strip()]
-            else:
-                candidate["capabilities"] = []
-            continue
-        if candidate is not None and stripped.startswith("notes:"):
-            candidate["notes"] = stripped.split(":", 1)[1].strip().strip('"')
+        if indent == 0 and stripped == "capabilities:":
+            section = "capabilities"
+            current_capability = None
+            current_phase = None
             continue
 
-    flush_phase()
+        if indent == 0 and stripped == "benchmark_order:":
+            section = "benchmark_order"
+            current_capability = None
+            current_phase = None
+            continue
+
+        if indent == 0 and stripped.endswith(":"):
+            # Any other top-level section ends parsing of the current structured block.
+            section = None
+            current_capability = None
+            current_phase = None
+            continue
+
+        if section == "capabilities":
+            if indent == 2 and stripped.endswith(":"):
+                current_capability = stripped[:-1].strip()
+                capability_to_models.setdefault(current_capability, [])
+                in_capability_candidates = False
+                continue
+
+            if current_capability is None:
+                continue
+
+            if indent == 4 and stripped.startswith("priority:"):
+                capability_priority[current_capability] = stripped.split(":", 1)[1].strip()
+                continue
+
+            if indent == 4 and stripped == "candidates:":
+                in_capability_candidates = True
+                continue
+
+            if indent == 6 and in_capability_candidates and stripped.startswith("- "):
+                model = stripped[2:].strip()
+                if model:
+                    capability_to_models[current_capability].append(model)
+                continue
+
+        if section == "benchmark_order":
+            if indent == 2 and stripped.endswith(":"):
+                current_phase = stripped[:-1].strip()
+                benchmark_order.setdefault(current_phase, [])
+                continue
+
+            if indent == 4 and current_phase and stripped.startswith("- "):
+                model = stripped[2:].strip()
+                if model:
+                    benchmark_order[current_phase].append(model)
+                continue
+
+    model_capabilities: dict[str, list[str]] = {}
+    model_priorities: dict[str, list[str]] = {}
+    for capability, models in capability_to_models.items():
+        for model in models:
+            model_capabilities.setdefault(model, []).append(capability)
+            priority = capability_priority.get(capability)
+            if priority:
+                model_priorities.setdefault(model, []).append(priority)
+
+    phases: list[dict] = []
+    for phase_id, models in benchmark_order.items():
+        candidates = []
+        for model in models:
+            candidates.append({
+                "model": model,
+                "capabilities": sorted(model_capabilities.get(model, [])),
+                "capability_priorities": sorted(set(model_priorities.get(model, []))),
+            })
+        phases.append({
+            "id": phase_id,
+            "description": phase_id.replace("_", " "),
+            "candidates": candidates,
+        })
+
     return phases
 
 
@@ -141,18 +192,18 @@ def main() -> None:
             entry = {
                 "model": name,
                 "capabilities": cand.get("capabilities", []),
+                "capability_priorities": cand.get("capability_priorities", []),
                 "plan_state": state,
                 "declared_size_gb": (record or {}).get("declared_size_gb"),
                 "cold_state": (record or {}).get("state"),
                 "locations": (record or {}).get("locations", []),
-                "notes": cand.get("notes"),
             }
             planned["candidates"].append(entry)
         planned_phases.append(planned)
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "captured_at_utc": stamp,
         "policy": {
             "read_only": True,
