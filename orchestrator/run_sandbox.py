@@ -135,7 +135,7 @@ Rules:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--proposal", required=True, help="verified orchestrator run JSON")
-    ap.add_argument("--repo", required=True, help="Git repository to sandbox")
+    ap.add_argument("--repo", required=True, help="path to an existing Git repository to sandbox")
     ap.add_argument("--endpoint", default=os.environ.get("OLLAMA_ENDPOINT", "http://127.0.0.1:11434"))
     ap.add_argument("--worker-model", default="granite3.3:2b")
     ap.add_argument("--context", type=int, default=16384)
@@ -147,13 +147,28 @@ def main() -> None:
     args = ap.parse_args()
 
     started = time.perf_counter()
-    repo = Path(args.repo).resolve()
-    proposal_path = Path(args.proposal).resolve()
+    repo = Path(args.repo).expanduser().resolve()
+    proposal_path = Path(args.proposal).expanduser().resolve()
+
+    if not proposal_path.is_file():
+        raise SystemExit(f"proposal file does not exist: {proposal_path}")
+    if not repo.exists():
+        raise SystemExit(
+            f"repository path does not exist: {repo}\n"
+            "--repo must point to a real local Git checkout, not the example placeholder path."
+        )
+    if not repo.is_dir():
+        raise SystemExit(f"repository path is not a directory: {repo}")
+
     proposal_run = json.loads(proposal_path.read_text(encoding="utf-8"))
     if proposal_run.get("status") != "verified_proposal":
         raise SystemExit("proposal input must have status=verified_proposal")
-    if not (repo / ".git").exists() and run(["git", "rev-parse", "--is-inside-work-tree"], cwd=repo, check=False).returncode != 0:
-        raise SystemExit(f"not a Git repository: {repo}")
+
+    repo_check = run(["git", "rev-parse", "--is-inside-work-tree"], cwd=repo, check=False)
+    if repo_check.returncode != 0 or repo_check.stdout.strip() != "true":
+        detail = repo_check.stderr.strip()
+        suffix = f" ({detail})" if detail else ""
+        raise SystemExit(f"not a Git repository: {repo}{suffix}")
 
     task = str(proposal_run.get("task", "")).strip()
     proposal_artifacts = [r.get("worker", {}).get("artifact") for r in proposal_run.get("results", [])]
