@@ -1,8 +1,7 @@
-version: 2
+version: 3
 
-# Capability-driven model catalog for a 48 GB Apple Silicon AI host.
-# Model names are defaults, not hard dependencies. Hermes should match
-# capabilities first and concrete models second.
+# Capability-driven model catalog for the measured 48 GB Apple Silicon host.
+# Stable interface: capabilities. Concrete models remain replaceable by benchmark evidence.
 
 host_profiles:
   mac_m4_pro_48gb:
@@ -14,61 +13,84 @@ host_profiles:
       prefer_local_execution: true
       external_execution: escalation_only
       avoid_multiple_large_dense_models: true
+      require_local_ssd_staging: true
 
 models:
   - id: local-router-small
     backend: ollama
     endpoint: http://AI_HOST:11434
-    model: qwen3.5:4b
+    model: qwen3:1.7b
     execution_class: local
     role_class: utility
-    memory_gb_estimate: 4
-    max_parallel: 3
+    evidence_status: measured
     preferred_for:
       - request classification
-      - capability routing
       - compact summaries
-      - task metadata extraction
+      - structured output
     capabilities:
       - routing.classify
       - summarization.compact
       - structured_output
       - reasoning.light
 
-  - id: local-worker-small
+  - id: local-implementer-small
     backend: ollama
     endpoint: http://AI_HOST:11434
-    model: qwen3.5:9b
+    model: granite3.3:2b
     execution_class: local
-    role_class: worker
-    memory_gb_estimate: 8
-    max_parallel: 2
+    role_class: implementer
+    evidence_status: measured
     preferred_for:
       - bounded code changes
-      - test generation
-      - documentation
-      - repository inspection
+      - first-pass code review
+      - structured output
     capabilities:
       - code.implement.small
       - code.review.light
-      - test.design
-      - docs.write
-      - tool_calling
       - structured_output
-      - reasoning.medium
+      - reasoning.light
+    caveats:
+      - code.review is provisional; one robustness fixture scored conditional.
+      - do not use as default test.design model.
+
+  - id: local-tester-small
+    backend: ollama
+    endpoint: http://AI_HOST:11434
+    model: ministral-3:3b
+    execution_class: local
+    role_class: tester
+    evidence_status: measured
+    preferred_for:
+      - regression test design
+      - boundary and branch test planning
+    capabilities:
+      - test.design
+      - test.review
+      - reasoning.light
+    caveats:
+      - weaker than granite3.3:2b on measured code.review fixtures.
+
+  - id: local-code-fallback-8b
+    backend: ollama
+    endpoint: http://AI_HOST:11434
+    model: granite-code:8b
+    execution_class: local
+    role_class: fallback_worker
+    evidence_status: measured_partial
+    capabilities:
+      - code.implement.small
+      - code.review.light
+    caveats:
+      - failed test.design due runaway repetitive output; not eligible for tester role.
 
   - id: local-code-specialist-moe
     backend: ollama
     endpoint: http://AI_HOST:11434
-    model: qwen3.5:35b-a3b-coding-nvfp4
+    model: qwen3.6:35b-a3b-coding-nvfp4
     execution_class: local
     role_class: senior_worker
+    evidence_status: candidate_unvalidated
     memory_gb_estimate: 21
-    max_parallel: 1
-    notes:
-      - MoE model with roughly 3B active parameters per token.
-      - Use when small workers fail or a task needs stronger agentic coding.
-      - Keep enough memory free for one or two small utility agents.
     capabilities:
       - code.implement
       - code.review
@@ -85,14 +107,11 @@ models:
     model: Qwen3.6-27B-4bit
     execution_class: local
     role_class: quality_reserve
+    evidence_status: candidate_unvalidated
     memory_gb_estimate: 18
-    max_parallel: 1
     policy:
       default_enabled: false
       activation: benchmark_or_escalation
-    notes:
-      - Dense model intended for difficult one-shot reasoning or code review.
-      - Prefer the MoE senior worker for normal operation to preserve throughput.
     capabilities:
       - code.review.deep
       - architecture.reasoning
@@ -107,7 +126,6 @@ models:
     execution_class: local
     role_class: retrieval
     memory_gb_estimate: 1
-    max_parallel: 4
     capabilities:
       - retrieval.embedding
       - knowledge.index
@@ -129,7 +147,9 @@ routing_policy:
     - reuse_existing_solution
     - decompose_if_needed
     - local_router_small
-    - local_worker_small
+    - local_implementer_small
+    - local_tester_small
+    - local_code_fallback_8b
     - local_code_specialist_moe
     - local_quality_reserve_dense
     - external_research_or_escalation
@@ -142,18 +162,24 @@ routing_policy:
     - send the minimum necessary project context externally.
 
 parallel_profiles:
-  normal:
-    description: Multiple bounded tasks executed locally.
+  measured_three_agent:
+    description: Verified local router + implementer + tester team.
+    concurrency_validated: true
+    measured_effective_speedup: 1.149
     recommended:
       - 1x local-router-small
-      - 2x local-worker-small
+      - 1x local-implementer-small
+      - 1x local-tester-small
 
-  mixed_review:
-    description: Strong coding/review task plus lightweight supporting agents.
+  implementation_with_review:
+    description: Bounded implementation followed by independent review/test gates.
     recommended:
-      - 1x local-code-specialist-moe
       - 1x local-router-small
-      - 1x local-embedding
+      - 1x local-implementer-small
+      - 1x local-tester-small
+    policy:
+      - reviewer_context_must_be_fresh: true
+      - tester_must_not_share_implementer_conversation: true
 
   deep_local:
     description: Highest local quality; sacrifice parallelism.
