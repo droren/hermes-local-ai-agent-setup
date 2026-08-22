@@ -28,10 +28,6 @@ def dsize(root: Path) -> int:
 def parse_ollama_manifest(manifests: Path, blobs: Path, mf: Path, store_name: str) -> dict:
     rel = mf.relative_to(manifests)
     p = rel.parts
-
-    # Normal layout: registry/namespace/model/tag. Legacy stores may prepend
-    # compatibility path elements before registry. Find the registry element
-    # rather than assuming it is at index zero.
     try:
         reg_idx = next(i for i, part in enumerate(p) if part.startswith('registry.'))
     except StopIteration:
@@ -47,27 +43,35 @@ def parse_ollama_manifest(manifests: Path, blobs: Path, mf: Path, store_name: st
     name = f'{namespace}/{model}:{tag}' if namespace != 'library' else f'{model}:{tag}'
 
     data = json.loads(mf.read_text())
-    layers = data.get('layers', [])
-    cfg = data.get('config', {})
-    refs = [x.get('digest') for x in [cfg, *layers] if x.get('digest')]
+    raw_layers = data.get('layers')
+    layers = raw_layers if isinstance(raw_layers, list) else []
+    raw_cfg = data.get('config')
+    cfg = raw_cfg if isinstance(raw_cfg, dict) else {}
+
+    refs = [x.get('digest') for x in [cfg, *layers] if isinstance(x, dict) and x.get('digest')]
     missing = [d for d in refs if not (blobs / d.replace(':', '-')).exists()] if blobs.exists() else refs
-    size = sum(int(x.get('size', 0) or 0) for x in [cfg, *layers])
+    size = sum(int(x.get('size', 0) or 0) for x in [cfg, *layers] if isinstance(x, dict))
+
+    # Cloud-only manifests often contain no local layers/config. Keep them as metadata,
+    # but do not treat them as stageable local models.
+    cloud_only = tag == 'cloud' or tag.endswith('-cloud') or (not refs and size == 0)
+    state = 'external_reference' if cloud_only else ('cold_available' if not missing else 'available_incomplete')
 
     return {
         'id': f'ollama:{name}',
         'name': name,
         'source': 'ollama',
-        'state': 'cold_available' if not missing else 'available_incomplete',
+        'state': state,
         'locations': [{
             'store': store_name,
             'manifest_path': str(mf),
             'blob_root': str(blobs),
-            'complete': len(missing) == 0,
+            'complete': (not cloud_only and len(missing) == 0),
             'missing_blob_count': len(missing),
         }],
         'declared_size_gb': gb(size),
         'runtime_hints': ['ollama'],
-        'requires_local_staging': True,
+        'requires_local_staging': not cloud_only,
     }
 
 
@@ -84,8 +88,6 @@ def discover_ollama_stores(root: Path) -> list[tuple[str, Path, Path]]:
         for p in stores.iterdir():
             if p.is_dir() and (p / 'manifests').exists():
                 candidates.append(p)
-
-    # Recovery/legacy layouts can be nested one or more levels deeper.
     for manifests in root.glob('**/manifests'):
         parent = manifests.parent
         if parent not in candidates:
@@ -176,6 +178,7 @@ def generic(root: Path, source: str) -> list[dict]:
 
 def merge_logical_models(models: list[dict]) -> list[dict]:
     merged: dict[str, dict] = {}
+    rank = {'inventory_error': 0, 'available_incomplete': 1, 'external_reference': 2, 'cold_available': 3}
     for m in models:
         key = m['id']
         if key not in merged:
@@ -183,12 +186,13 @@ def merge_logical_models(models: list[dict]) -> list[dict]:
             continue
         current = merged[key]
         current.setdefault('locations', []).extend(m.get('locations', []))
-        # Prefer a complete copy if at least one location is complete.
-        states = {current.get('state'), m.get('state')}
-        if 'cold_available' in states:
-            current['state'] = 'cold_available'
-        current['declared_size_gb'] = max(current.get('declared_size_gb', 0), m.get('declared_size_gb', 0))
-        current['size_gb'] = max(current.get('size_gb', 0), m.get('size_gb', 0))
+        if rank.get(m.get('state'), -1) > rank.get(current.get('state'), -1):
+            current['state'] = m.get('state')
+        if 'declared_size_gb' in m:
+            current['declared_size_gb'] = max(current.get('declared_size_gb', 0) or 0, m.get('declared_size_gb', 0) or 0)
+        if 'size_gb' in m:
+            current['size_gb'] = max(current.get('size_gb', 0) or 0, m.get('size_gb', 0) or 0)
+        current['requires_local_staging'] = current.get('state') != 'external_reference'
     return sorted(merged.values(), key=lambda x: (x['source'], x['name']))
 
 
@@ -227,7 +231,7 @@ def main():
 
     stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     payload = {
-        'schema_version': 3,
+        'schema_version': 4,
         'captured_at_utc': stamp,
         'inventory_kind': 'cold_model_library',
         'execution_policy': 'stage_to_local_ssd_before_activation',
@@ -241,7 +245,7 @@ def main():
 
     outdir = Path(a.output_dir)
     outdir.mkdir(parents=True, exist_ok=True)
-    out = outdir / f'model-library-v3-{stamp}.json'
+    out = outdir / f'model-library-v4-{stamp}.json'
     out.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + '\n')
     print(out)
 
