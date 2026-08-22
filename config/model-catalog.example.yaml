@@ -1,51 +1,188 @@
-version: 1
+version: 3
+
+# Capability-driven model catalog for the measured 48 GB Apple Silicon host.
+# Stable interface: capabilities. Concrete models remain replaceable by benchmark evidence.
+
+host_profiles:
+  mac_m4_pro_48gb:
+    unified_memory_gb: 48
+    reserve_for_os_and_runtime_gb: 10
+    target_model_budget_gb: 38
+    policy:
+      prefer_parallel_small_models: true
+      prefer_local_execution: true
+      external_execution: escalation_only
+      avoid_multiple_large_dense_models: true
+      require_local_ssd_staging: true
+
 models:
-  - id: local-fast-general
+  - id: local-router-small
     backend: ollama
     endpoint: http://AI_HOST:11434
-    model: REPLACE_ME
+    model: qwen3:1.7b
     execution_class: local
-    memory_gb_estimate: 6
-    max_parallel: 2
+    role_class: utility
+    evidence_status: measured
+    preferred_for:
+      - request classification
+      - compact summaries
+      - structured output
     capabilities:
       - routing.classify
       - summarization.compact
       - structured_output
       - reasoning.light
 
-  - id: local-code-specialist
+  - id: local-implementer-small
     backend: ollama
     endpoint: http://AI_HOST:11434
-    model: REPLACE_ME
+    model: granite3.3:2b
     execution_class: local
-    memory_gb_estimate: 12
-    max_parallel: 2
+    role_class: implementer
+    evidence_status: measured
+    preferred_for:
+      - bounded code changes
+      - first-pass code review
+      - structured output
+    capabilities:
+      - code.implement.small
+      - code.review.light
+      - structured_output
+      - reasoning.light
+    caveats:
+      - code.review is provisional; one robustness fixture scored conditional.
+      - do not use as default test.design model.
+
+  - id: local-tester-small
+    backend: ollama
+    endpoint: http://AI_HOST:11434
+    model: ministral-3:3b
+    execution_class: local
+    role_class: tester
+    evidence_status: measured
+    preferred_for:
+      - regression test design
+      - boundary and branch test planning
+    capabilities:
+      - test.design
+      - test.review
+      - reasoning.light
+    caveats:
+      - weaker than granite3.3:2b on measured code.review fixtures.
+
+  - id: local-code-fallback-8b
+    backend: ollama
+    endpoint: http://AI_HOST:11434
+    model: granite-code:8b
+    execution_class: local
+    role_class: fallback_worker
+    evidence_status: measured_partial
+    capabilities:
+      - code.implement.small
+      - code.review.light
+    caveats:
+      - failed test.design due runaway repetitive output; not eligible for tester role.
+
+  - id: local-code-specialist-moe
+    backend: ollama
+    endpoint: http://AI_HOST:11434
+    model: qwen3.6:35b-a3b-coding-nvfp4
+    execution_class: local
+    role_class: senior_worker
+    evidence_status: candidate_unvalidated
+    memory_gb_estimate: 21
     capabilities:
       - code.implement
       - code.review
       - test.design
+      - planning.decomposition
+      - architecture.reasoning.medium
       - tool_calling
       - structured_output
+      - reasoning.deep
 
-  - id: local-reasoner
+  - id: local-quality-reserve-dense
+    backend: mlx
+    endpoint: http://AI_HOST:18083/v1
+    model: Qwen3.6-27B-4bit
+    execution_class: local
+    role_class: quality_reserve
+    evidence_status: candidate_unvalidated
+    memory_gb_estimate: 18
+    policy:
+      default_enabled: false
+      activation: benchmark_or_escalation
+    capabilities:
+      - code.review.deep
+      - architecture.reasoning
+      - reasoning.deep
+      - planning.decomposition
+      - structured_output
+
+  - id: local-embedding
     backend: ollama
     endpoint: http://AI_HOST:11434
-    model: REPLACE_ME
+    model: nomic-embed-text
     execution_class: local
-    memory_gb_estimate: 24
-    max_parallel: 1
+    role_class: retrieval
+    memory_gb_estimate: 1
     capabilities:
-      - planning.decomposition
-      - architecture.reasoning
-      - reasoning.medium
-      - reasoning.deep
-      - structured_output
+      - retrieval.embedding
+      - knowledge.index
 
   - id: external-research-or-escalation
     backend: existing-hermes-provider
     execution_class: external
+    role_class: escalation
     external_policy: escalation_only
     capabilities:
       - research.web.current
       - architecture.reasoning
       - reasoning.deep
+      - code.review.deep
+
+routing_policy:
+  order:
+    - retrieve_existing_knowledge
+    - reuse_existing_solution
+    - decompose_if_needed
+    - local_router_small
+    - local_implementer_small
+    - local_tester_small
+    - local_code_fallback_8b
+    - local_code_specialist_moe
+    - local_quality_reserve_dense
+    - external_research_or_escalation
+
+  escalation_rules:
+    - external models MUST NOT be selected merely because they are stronger.
+    - first attempt task decomposition and local delegation.
+    - external research is allowed when current web knowledge is materially required.
+    - external architecture/reasoning requires an explicit escalation reason in the task log.
+    - send the minimum necessary project context externally.
+
+parallel_profiles:
+  measured_three_agent:
+    description: Verified local router + implementer + tester team.
+    concurrency_validated: true
+    measured_effective_speedup: 1.149
+    recommended:
+      - 1x local-router-small
+      - 1x local-implementer-small
+      - 1x local-tester-small
+
+  implementation_with_review:
+    description: Bounded implementation followed by independent review/test gates.
+    recommended:
+      - 1x local-router-small
+      - 1x local-implementer-small
+      - 1x local-tester-small
+    policy:
+      - reviewer_context_must_be_fresh: true
+      - tester_must_not_share_implementer_conversation: true
+
+  deep_local:
+    description: Highest local quality; sacrifice parallelism.
+    recommended:
+      - 1x local-quality-reserve-dense
+      - 1x local-router-small
