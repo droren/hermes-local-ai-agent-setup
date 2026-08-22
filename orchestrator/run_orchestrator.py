@@ -2,22 +2,14 @@
 """Standalone Hermes Next local orchestrator prototype.
 
 Flow:
-  task
-   -> local knowledge retrieval
-   -> route / complexity decision
-   -> optional decomposition
-   -> bounded local worker execution
-   -> independent tester review
-   -> verification gate
-   -> structured run log
+  task -> local retrieval -> route -> optional decomposition -> proposal worker
+       -> proposal-aware tester -> verification gate -> structured run log
 
 Safety:
 - read-only against project repositories;
 - never applies patches or executes generated code;
 - never downloads/stages/evicts models;
 - external escalation is recorded as a recommendation only.
-
-This prototype intentionally sits outside the user's active Hermes profile.
 """
 from __future__ import annotations
 
@@ -29,7 +21,18 @@ import time
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+ALLOWED_CAPABILITIES = {
+    "code.implement.small",
+    "code.implement",
+    "code.review",
+    "test.design",
+    "planning.decomposition",
+    "research.web.current",
+    "structured_output",
+    "summarization.compact",
+}
 
 
 def post_json(url: str, payload: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
@@ -66,36 +69,29 @@ def ollama_generate(
     if json_mode:
         payload["format"] = "json"
     raw = post_json(endpoint.rstrip("/") + "/api/generate", payload)
-    wall = time.perf_counter() - started
     return {
         "model": model,
         "response": raw.get("response", ""),
         "done_reason": raw.get("done_reason"),
-        "wall_seconds": round(wall, 3),
+        "wall_seconds": round(time.perf_counter() - started, 3),
         "output_tokens": int(raw.get("eval_count", 0) or 0),
     }
 
 
 def extract_json(text: str) -> Any:
-    """Parse plain/fenced JSON or the first balanced JSON object in model output."""
     s = (text or "").strip()
     if not s:
         return None
-
     try:
         return json.loads(s)
     except Exception:
         pass
-
-    # Common model behavior: fenced JSON despite 'JSON only'.
-    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", s, flags=re.IGNORECASE | re.DOTALL)
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", s, flags=re.I | re.S)
     if fenced:
         try:
             return json.loads(fenced.group(1))
         except Exception:
             pass
-
-    # Find the first balanced object while respecting JSON strings/escapes.
     for start, ch in enumerate(s):
         if ch != "{":
             continue
@@ -119,9 +115,8 @@ def extract_json(text: str) -> Any:
             elif c == "}":
                 depth -= 1
                 if depth == 0:
-                    candidate = s[start:i + 1]
                     try:
-                        return json.loads(candidate)
+                        return json.loads(s[start:i + 1])
                     except Exception:
                         break
     return None
@@ -135,26 +130,74 @@ def generate_json_with_retry(
     ctx: int,
     max_tokens: int,
     stage: str,
-) -> tuple[Any, dict[str, Any]]:
-    """Use Ollama JSON mode and retry once if the model still returns invalid JSON."""
-    raw = ollama_generate(endpoint, model, prompt, ctx=ctx, max_tokens=max_tokens, json_mode=True)
-    parsed = extract_json(raw["response"])
-    if isinstance(parsed, dict):
-        raw["parse_attempts"] = 1
-        return parsed, raw
+    validator: Callable[[dict[str, Any]], tuple[bool, str]] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Retry once on invalid JSON *or* schema-invalid JSON."""
+    first = ollama_generate(endpoint, model, prompt, ctx=ctx, max_tokens=max_tokens, json_mode=True)
+    parsed = extract_json(first["response"])
+    valid = isinstance(parsed, dict)
+    reason = "invalid_json"
+    if valid and validator:
+        valid, reason = validator(parsed)
+    if valid:
+        first["parse_attempts"] = 1
+        return parsed, first
 
     retry_prompt = (
-        "Your previous response was not valid JSON. Output exactly one JSON object and nothing else. "
-        "No markdown, no code fences, no explanation.\n\n" + prompt
+        "Your previous answer was unusable. Return exactly one complete JSON object matching the requested schema. "
+        f"Validation failure: {reason}. Do not return an empty object. No markdown or explanation.\n\n" + prompt
     )
     retry = ollama_generate(endpoint, model, retry_prompt, ctx=ctx, max_tokens=max_tokens, json_mode=True)
     retry["parse_attempts"] = 2
-    retry["first_response"] = raw.get("response", "")
+    retry["first_response"] = first.get("response", "")
+    retry["first_validation_error"] = reason
     parsed = extract_json(retry["response"])
-    if not isinstance(parsed, dict):
+    valid = isinstance(parsed, dict)
+    reason = "invalid_json"
+    if valid and validator:
+        valid, reason = validator(parsed)
+    if not valid:
         preview = (retry.get("response") or "").replace("\n", " ")[:500]
-        raise RuntimeError(f"{stage} returned invalid JSON after retry; response={preview!r}")
+        raise RuntimeError(f"{stage} returned invalid result after retry ({reason}); response={preview!r}")
     return parsed, retry
+
+
+def validate_route(obj: dict[str, Any]) -> tuple[bool, str]:
+    cap = obj.get("capability")
+    complexity = obj.get("complexity")
+    if cap not in ALLOWED_CAPABILITIES:
+        return False, "missing_or_invalid_capability"
+    if complexity not in {"small", "medium", "large"}:
+        return False, "missing_or_invalid_complexity"
+    if not isinstance(obj.get("needs_decomposition"), bool):
+        return False, "needs_decomposition_must_be_boolean"
+    if not isinstance(obj.get("needs_current_web"), bool):
+        return False, "needs_current_web_must_be_boolean"
+    if not isinstance(obj.get("reason"), str) or not obj["reason"].strip():
+        return False, "reason_required"
+    return True, "ok"
+
+
+def validate_worker(obj: dict[str, Any]) -> tuple[bool, str]:
+    if obj.get("status") != "proposed":
+        return False, "status_must_be_proposed"
+    changes = obj.get("proposed_changes")
+    if not isinstance(changes, list) or not changes:
+        return False, "proposed_changes_required"
+    if not isinstance(obj.get("verification_needed"), list) or not obj["verification_needed"]:
+        return False, "verification_needed_required"
+    return True, "ok"
+
+
+def validate_tester(obj: dict[str, Any]) -> tuple[bool, str]:
+    if not isinstance(obj.get("pass"), bool):
+        return False, "pass_must_be_boolean"
+    for field in ("blocking_issues", "missing_tests", "verification_steps"):
+        if not isinstance(obj.get(field), list):
+            return False, f"{field}_must_be_list"
+    if obj.get("confidence") not in {"low", "medium", "high"}:
+        return False, "invalid_confidence"
+    return True, "ok"
 
 
 def words(text: str) -> set[str]:
@@ -181,20 +224,21 @@ def retrieve_local(task: str, roots: list[str], limit: int = 6) -> list[dict[str
             except OSError:
                 continue
             sample = text[:12000]
-            tokens = words(sample)
-            overlap = len(query & tokens)
-            if overlap == 0:
-                continue
-            score = overlap / max(1, len(query))
-            snippet = " ".join(sample.replace("\n", " ").split())[:600]
-            hits.append({"path": str(path), "score": round(score, 3), "snippet": snippet})
+            overlap = len(query & words(sample))
+            if overlap:
+                hits.append({
+                    "path": str(path),
+                    "score": round(overlap / max(1, len(query)), 3),
+                    "snippet": " ".join(sample.replace("\n", " ").split())[:600],
+                })
     hits.sort(key=lambda x: (-x["score"], x["path"]))
     return hits[:limit]
 
 
-def route_task(endpoint: str, model: str, task: str, knowledge: list[dict[str, Any]], ctx: int) -> tuple[dict[str, Any], dict[str, Any]]:
+def route_task(endpoint: str, model: str, task: str, knowledge: list[dict[str, Any]], ctx: int):
     knowledge_text = "\n".join(f"- {h['path']}: {h['snippet']}" for h in knowledge) or "- none found"
-    prompt = f"""You are the Hermes Next routing agent. Return JSON only.
+    prompt = f"""You are the Hermes Next routing agent.
+Classify the task; do not solve it.
 
 Task:
 {task}
@@ -202,59 +246,37 @@ Task:
 Previously retrieved local knowledge:
 {knowledge_text}
 
-Choose one primary capability from:
-- code.implement.small
-- code.implement
-- code.review
-- test.design
-- planning.decomposition
-- research.web.current
-- structured_output
-- summarization.compact
+Allowed capabilities: {', '.join(sorted(ALLOWED_CAPABILITIES))}
 
-Return exactly:
+Return exactly one JSON object with all fields populated:
 {{
-  "capability": "...",
+  "capability": "one allowed capability",
   "complexity": "small|medium|large",
   "needs_decomposition": true,
   "needs_current_web": false,
-  "reason": "short reason"
+  "reason": "one short reason"
 }}
 """
-    parsed, raw = generate_json_with_retry(
-        endpoint, model, prompt, ctx=ctx, max_tokens=384, stage="router"
+    return generate_json_with_retry(
+        endpoint, model, prompt, ctx=ctx, max_tokens=384, stage="router", validator=validate_route
     )
-    return parsed, raw
 
 
-def decompose_task(endpoint: str, model: str, task: str, route: dict[str, Any], knowledge: list[dict[str, Any]], ctx: int) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+def decompose_task(endpoint: str, model: str, task: str, route: dict[str, Any], ctx: int):
     if not route.get("needs_decomposition"):
         return [{"id": "task-1", "goal": task, "acceptance": ["satisfy the requested change"]}], None
+    prompt = f"""You are a local decomposition agent. Break the request into the fewest independently verifiable bounded subtasks. Do not perform the work.
 
-    prompt = f"""You are a local decomposition agent. Return JSON only.
-Break the request into the fewest independently verifiable bounded subtasks.
-Do not perform the work.
+Request: {task}
+Routing decision: {json.dumps(route, ensure_ascii=False)}
 
-Request:
-{task}
-
-Routing decision:
-{json.dumps(route, ensure_ascii=False)}
-
-Return:
-{{"subtasks":[{{"id":"task-1","goal":"...","acceptance":["..."]}}]}}
+Return JSON:
+{{"subtasks":[{{"id":"task-1","goal":"...","acceptance":["specific verifiable criterion"]}}]}}
 """
     try:
-        parsed, raw = generate_json_with_retry(
-            endpoint, model, prompt, ctx=ctx, max_tokens=512, stage="decomposition"
-        )
+        parsed, raw = generate_json_with_retry(endpoint, model, prompt, ctx=ctx, max_tokens=512, stage="decomposition")
     except RuntimeError as exc:
-        return [{"id": "task-1", "goal": task, "acceptance": ["satisfy the requested change"]}], {
-            "model": model,
-            "response": "",
-            "error": str(exc),
-            "fallback_used": True,
-        }
+        return [{"id": "task-1", "goal": task, "acceptance": ["satisfy the requested change"]}], {"error": str(exc), "fallback_used": True}
     subtasks = parsed.get("subtasks")
     if not isinstance(subtasks, list) or not subtasks:
         return [{"id": "task-1", "goal": task, "acceptance": ["satisfy the requested change"]}], raw
@@ -262,19 +284,18 @@ Return:
     for i, sub in enumerate(subtasks[:8], 1):
         if not isinstance(sub, dict):
             continue
-        clean.append({
-            "id": str(sub.get("id") or f"task-{i}"),
-            "goal": str(sub.get("goal") or "").strip(),
-            "acceptance": sub.get("acceptance") if isinstance(sub.get("acceptance"), list) else [],
-        })
+        goal = str(sub.get("goal") or "").strip()
+        acceptance = sub.get("acceptance") if isinstance(sub.get("acceptance"), list) else []
+        if goal:
+            clean.append({"id": str(sub.get("id") or f"task-{i}"), "goal": goal, "acceptance": acceptance})
     return clean or [{"id": "task-1", "goal": task, "acceptance": ["satisfy the requested change"]}], raw
 
 
-def run_worker(endpoint: str, model: str, task: str, subtask: dict[str, Any], knowledge: list[dict[str, Any]], ctx: int) -> dict[str, Any]:
+def run_worker(endpoint: str, model: str, task: str, subtask: dict[str, Any], knowledge: list[dict[str, Any]], ctx: int):
     knowledge_text = "\n".join(f"- {h['path']}: {h['snippet']}" for h in knowledge) or "- none"
-    prompt = f"""You are the bounded local implementation worker.
-This is a READ-ONLY prototype: do not claim files were modified or commands were executed.
-Produce a proposed implementation artifact for later application/review.
+    prompt = f"""You are the bounded local implementation worker in READ-ONLY PROPOSAL MODE.
+Nothing has been changed yet. Never say a change was 'added', 'implemented', 'fixed', or 'verified'. Describe what SHOULD be changed.
+Be concrete enough that a later patch-producing agent can implement the proposal.
 
 Overall request:
 {task}
@@ -285,31 +306,32 @@ Subtask:
 Retrieved project knowledge:
 {knowledge_text}
 
-Return JSON only:
+Return JSON:
 {{
   "status": "proposed",
-  "summary": "...",
-  "proposed_changes": [{{"target":"file/module or unknown","change":"..."}}],
+  "summary": "proposal summary using future/conditional wording",
+  "proposed_changes": [{{"target":"specific file/module or unknown","change":"specific intended change"}}],
   "assumptions": ["..."],
-  "verification_needed": ["..."]
+  "test_cases": [{{"input":"...","expected":"..."}}],
+  "verification_needed": ["specific check that can be executed later"]
 }}
 """
     try:
         parsed, raw = generate_json_with_retry(
-            endpoint, model, prompt, ctx=ctx, max_tokens=768, stage="worker"
+            endpoint, model, prompt, ctx=ctx, max_tokens=768, stage="worker", validator=validate_worker
         )
     except RuntimeError as exc:
-        raw = {"model": model, "response": "", "error": str(exc)}
-        parsed = None
+        return {"subtask": subtask, "raw": {"model": model, "error": str(exc)}, "artifact": None}
     return {"subtask": subtask, "raw": raw, "artifact": parsed}
 
 
-def run_tester(endpoint: str, model: str, task: str, worker_result: dict[str, Any], ctx: int) -> dict[str, Any]:
+def run_tester(endpoint: str, model: str, task: str, worker_result: dict[str, Any], ctx: int):
     artifact = worker_result.get("artifact")
-    prompt = f"""You are the independent Hermes Next tester/reviewer.
-Evaluate the proposed artifact against the task and subtask acceptance criteria.
-Do not trust the implementer's conclusions. Do not rewrite the implementation.
-Return JSON only.
+    prompt = f"""You are the independent Hermes Next proposal reviewer/test designer.
+THIS IS READ-ONLY PROPOSAL MODE. No patch exists and no tests have been executed yet.
+Do NOT reject merely because execution evidence, logs, or applied code are absent.
+Instead judge whether the proposal is internally consistent, preserves the stated constraints, identifies the intended change, and contains sufficient future verification/test steps to proceed safely to a sandbox implementation stage.
+Reject only for genuine proposal defects: missing requirement coverage, contradictory behavior, unsafe assumptions, incorrect boundaries, missing essential tests, or an implementation plan too vague to execute.
 
 Overall request:
 {task}
@@ -320,27 +342,26 @@ Subtask:
 Proposed artifact:
 {json.dumps(artifact, ensure_ascii=False)}
 
-Return:
+Return JSON:
 {{
   "pass": true,
-  "blocking_issues": ["..."],
-  "missing_tests": ["..."],
-  "verification_steps": ["..."],
+  "blocking_issues": [],
+  "missing_tests": [],
+  "verification_steps": ["checks to run after a sandbox patch exists"],
   "confidence": "low|medium|high"
 }}
 """
     try:
         parsed, raw = generate_json_with_retry(
-            endpoint, model, prompt, ctx=ctx, max_tokens=640, stage="tester"
+            endpoint, model, prompt, ctx=ctx, max_tokens=640, stage="tester", validator=validate_tester
         )
     except RuntimeError as exc:
-        raw = {"model": model, "response": "", "error": str(exc)}
-        parsed = None
+        return {"raw": {"model": model, "error": str(exc)}, "evaluation": None}
     return {"raw": raw, "evaluation": parsed}
 
 
 def verification_gate(worker: dict[str, Any], tester: dict[str, Any]) -> tuple[bool, list[str]]:
-    reasons = []
+    reasons: list[str] = []
     artifact = worker.get("artifact")
     evaluation = tester.get("evaluation")
     if not isinstance(artifact, dict):
@@ -350,6 +371,8 @@ def verification_gate(worker: dict[str, Any], tester: dict[str, Any]) -> tuple[b
         return False, reasons
     if evaluation.get("pass") is not True:
         reasons.append("tester_rejected")
+    if evaluation.get("blocking_issues"):
+        reasons.append("blocking_issues_present")
     if tester.get("raw", {}).get("done_reason") == "length":
         reasons.append("tester_hit_output_limit")
     if worker.get("raw", {}).get("done_reason") == "length":
@@ -370,13 +393,10 @@ def main() -> None:
     ap.add_argument("--output-dir", default="artifacts/orchestrator-runs")
     args = ap.parse_args()
 
-    task = args.task
-    if args.task_file:
-        task = Path(args.task_file).read_text(encoding="utf-8")
+    task = Path(args.task_file).read_text(encoding="utf-8") if args.task_file else args.task
     if not task or not task.strip():
         raise SystemExit("provide task text or --task-file")
     task = task.strip()
-
     roots = args.knowledge_root or ["docs", "knowledge", "experience", "config"]
     started = time.perf_counter()
     events: list[dict[str, Any]] = []
@@ -389,7 +409,7 @@ def main() -> None:
 
         if route.get("needs_current_web") or route.get("capability") == "research.web.current":
             final = {
-                "schema_version": 2,
+                "schema_version": 3,
                 "status": "external_escalation_recommended",
                 "task": task,
                 "knowledge": knowledge,
@@ -399,9 +419,8 @@ def main() -> None:
                 "note": "Prototype does not call external providers. Hermes integration should apply escalation policy.",
             }
         else:
-            subtasks, decomposition_raw = decompose_task(args.endpoint, args.router_model, task, route, knowledge, args.context)
+            subtasks, decomposition_raw = decompose_task(args.endpoint, args.router_model, task, route, args.context)
             events.append({"state": "decomposition", "subtask_count": len(subtasks)})
-
             results = []
             all_pass = True
             for subtask in subtasks:
@@ -417,16 +436,11 @@ def main() -> None:
                     "tester": tester,
                     "verification": {"pass": passed, "reasons": reasons},
                 })
-
             final = {
-                "schema_version": 2,
+                "schema_version": 3,
                 "status": "verified_proposal" if all_pass else "verification_failed",
                 "task": task,
-                "models": {
-                    "router": args.router_model,
-                    "worker": args.worker_model,
-                    "tester": args.tester_model,
-                },
+                "models": {"router": args.router_model, "worker": args.worker_model, "tester": args.tester_model},
                 "knowledge": knowledge,
                 "route": route,
                 "router_raw": route_raw,
@@ -435,7 +449,7 @@ def main() -> None:
                 "results": results,
                 "events": events,
                 "safety": {
-                    "read_only": True,
+                    "mode": "read_only_proposal",
                     "patches_applied": False,
                     "commands_executed": False,
                     "external_provider_called": False,
@@ -444,28 +458,18 @@ def main() -> None:
     except Exception as exc:
         events.append({"state": "error", "error": str(exc)})
         final = {
-            "schema_version": 2,
+            "schema_version": 3,
             "status": "orchestrator_error",
             "task": task,
-            "models": {
-                "router": args.router_model,
-                "worker": args.worker_model,
-                "tester": args.tester_model,
-            },
+            "models": {"router": args.router_model, "worker": args.worker_model, "tester": args.tester_model},
             "knowledge": knowledge,
             "events": events,
             "error": str(exc),
-            "safety": {
-                "read_only": True,
-                "patches_applied": False,
-                "commands_executed": False,
-                "external_provider_called": False,
-            },
+            "safety": {"mode": "read_only_proposal", "patches_applied": False, "commands_executed": False, "external_provider_called": False},
         }
 
     final["wall_seconds"] = round(time.perf_counter() - started, 3)
     final["captured_at_utc"] = datetime.now(timezone.utc).isoformat()
-
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
