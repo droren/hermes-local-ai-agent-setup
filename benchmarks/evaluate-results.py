@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import argparse
-import ast
 import json
-import re
 from pathlib import Path
 
 
@@ -187,10 +185,20 @@ def evaluate(path: Path) -> dict:
     }
 
 
+def default_output(paths: list[str]) -> Path:
+    if len(paths) == 1:
+        p = Path(paths[0])
+        if p.is_dir():
+            return p.parent / f'{p.name}-evaluation.json'
+        if p.is_file():
+            return p.with_name(f'{p.stem}-evaluation.json')
+    return Path('artifacts/benchmarks/evaluation.json')
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument('paths', nargs='+', help='Result JSON files or directories')
-    ap.add_argument('--output', default='artifacts/benchmarks/phase1-evaluation.json')
+    ap.add_argument('--output', help='Explicit evaluation JSON path')
     args = ap.parse_args()
 
     files = []
@@ -203,11 +211,11 @@ def main() -> None:
     results = [evaluate(p) for p in files]
     results.sort(key=lambda x: (x.get('model') or '', x.get('capability') or ''))
     payload = {
-        'schema_version': 1,
+        'schema_version': 2,
         'scoring_policy': {'pass': '>=80', 'conditional': '60-79.9', 'fail': '<60'},
         'results': results,
     }
-    out = Path(args.output)
+    out = Path(args.output) if args.output else default_output(args.paths)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
     for r in results:
